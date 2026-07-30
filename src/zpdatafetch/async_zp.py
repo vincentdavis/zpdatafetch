@@ -6,8 +6,8 @@ allowing for concurrent requests and better performance in async applications.
 
 from typing import Any
 
-import httpx
-from bs4 import BeautifulSoup
+import httpx2
+from justhtml import Element, JustHTML
 
 from shared.error_helpers import format_auth_error, format_network_error
 from shared.exceptions import (
@@ -46,11 +46,9 @@ class AsyncZP(AsyncBaseHTTPClient):
     login_response: Response from the login POST request
   """
 
-  _client: httpx.AsyncClient | None = None
-  _login_url: str = (
-    'https://zwiftpower.com/ucp.php?mode=login&login=external&oauth_service=oauthzpsso'
-  )
-  _shared_client: httpx.AsyncClient | None = None
+  _client: httpx2.AsyncClient | None = None
+  _login_url: str = 'https://zwiftpower.com/ucp.php?mode=login&login=external&oauth_service=oauthzpsso'
+  _shared_client: httpx2.AsyncClient | None = None
   _owns_client: bool = False
 
   # ----------------------------------------------------------------------------
@@ -73,7 +71,7 @@ class AsyncZP(AsyncBaseHTTPClient):
     self.config.load()
     self.username: str = self.config.username
     self.password: str = self.config.password
-    self.login_response: httpx.Response | None = None
+    self.login_response: httpx2.Response | None = None
 
     if not skip_credential_check and (not self.username or not self.password):
       raise ConfigError(
@@ -85,7 +83,7 @@ class AsyncZP(AsyncBaseHTTPClient):
     # This ensures _shared_client is available for tests
     if shared_client and AsyncZP._shared_client is None:
       logger.debug('Creating shared async HTTP client for connection pooling')
-      AsyncZP._shared_client = httpx.AsyncClient(
+      AsyncZP._shared_client = httpx2.AsyncClient(
         follow_redirects=True,
         verify=True,
       )
@@ -131,7 +129,7 @@ class AsyncZP(AsyncBaseHTTPClient):
       logger.debug(f'Fetching url: {self._login_url}')
       page = await self._client.get(self._login_url)
       page.raise_for_status()
-    except httpx.HTTPStatusError as e:
+    except httpx2.HTTPStatusError as e:
       logger.error(f'Failed to fetch login page: {e}')
       raise NetworkError(
         format_network_error(
@@ -141,7 +139,7 @@ class AsyncZP(AsyncBaseHTTPClient):
           status_code=e.response.status_code,
         ),
       ) from e
-    except httpx.RequestError as e:
+    except httpx2.RequestError as e:
       logger.error(f'Network error during login: {e}')
       raise NetworkError(
         format_network_error('fetch login page', self._login_url, e),
@@ -150,8 +148,14 @@ class AsyncZP(AsyncBaseHTTPClient):
     self._client.cookies.get('phpbb3_lswlk_sid')
 
     try:
-      soup = BeautifulSoup(page.text, 'lxml')
-      if not soup.form or 'action' not in soup.form.attrs:
+      # JustHTML sanitizes by default (which strips <form>); disable it since we
+      # only read the login form's action from ZwiftPower's own page, never render it.
+      doc = JustHTML(page.text, sanitize=False)
+      form = doc.query_one('form')
+      login_url_from_form = (
+        form.attrs.get('action') if isinstance(form, Element) else None
+      )
+      if not login_url_from_form:
         logger.error('Login form not found on page')
         raise AuthenticationError(
           format_auth_error(
@@ -161,11 +165,6 @@ class AsyncZP(AsyncBaseHTTPClient):
             suggestion='Zwiftpower may have changed their login flow. Contact support if this persists.',
           ),
         )
-      action_value = soup.form['action']
-      # BeautifulSoup can return str or list[str] for attributes
-      login_url_from_form = (
-        action_value[0] if isinstance(action_value, list) else action_value
-      )
       logger.debug(f'Extracted login form URL: {login_url_from_form}')
     except (AttributeError, KeyError) as e:
       logger.error(f'Could not parse login form: {e}')
@@ -204,7 +203,7 @@ class AsyncZP(AsyncBaseHTTPClient):
           ),
         )
       logger.info('Successfully authenticated with Zwiftpower')
-    except httpx.HTTPStatusError as e:
+    except httpx2.HTTPStatusError as e:
       logger.error(f'HTTP error during authentication: {e}')
       raise NetworkError(
         format_network_error(
@@ -214,7 +213,7 @@ class AsyncZP(AsyncBaseHTTPClient):
           status_code=e.response.status_code,
         ),
       ) from e
-    except httpx.RequestError as e:
+    except httpx2.RequestError as e:
       logger.error(f'Network error during authentication: {e}')
       raise NetworkError(
         format_network_error(
@@ -225,20 +224,20 @@ class AsyncZP(AsyncBaseHTTPClient):
       ) from e
 
   # ----------------------------------------------------------------------------
-  async def _create_client(self) -> httpx.AsyncClient:
+  async def _create_client(self) -> httpx2.AsyncClient:
     """Create and configure an async HTTP client.
 
     SECURITY: All connections use HTTPS with certificate verification enabled.
     This protects against man-in-the-middle attacks.
 
     Returns:
-      Configured httpx.AsyncClient instance
+      Configured httpx2.AsyncClient instance
     """
     logger.debug(
       'Creating new httpx async client with HTTPS certificate verification',
     )
     # SECURITY: Explicitly enable certificate verification for HTTPS
-    return httpx.AsyncClient(follow_redirects=True, verify=True)
+    return httpx2.AsyncClient(follow_redirects=True, verify=True)
 
   # ----------------------------------------------------------------------------
   async def _before_request(
@@ -308,10 +307,13 @@ class AsyncZP(AsyncBaseHTTPClient):
       return res
     except NetworkError:
       raise
-    except httpx.HTTPStatusError as e:
+    except httpx2.HTTPStatusError as e:
       logger.debug(f'HTTP error fetching {endpoint}: {e}')
       # Special handling for 403 on cyclist profile URLs
-      if e.response.status_code == 403 and 'zwiftpower.com/cache3/profile/' in endpoint:
+      if (
+        e.response.status_code == 403
+        and 'zwiftpower.com/cache3/profile/' in endpoint
+      ):
         raise NetworkError(
           format_network_error(
             'fetch Zwift profile',
@@ -328,7 +330,7 @@ class AsyncZP(AsyncBaseHTTPClient):
           status_code=e.response.status_code,
         ),
       ) from e
-    except httpx.RequestError as e:
+    except httpx2.RequestError as e:
       logger.error(f'Network error fetching {endpoint}: {e}')
       raise NetworkError(
         format_network_error('fetch JSON data', endpoint, e),
@@ -371,7 +373,7 @@ class AsyncZP(AsyncBaseHTTPClient):
       return pres.text
     except NetworkError:
       raise
-    except httpx.HTTPStatusError as e:
+    except httpx2.HTTPStatusError as e:
       logger.error(f'HTTP error fetching {endpoint}: {e}')
       raise NetworkError(
         format_network_error(
@@ -381,7 +383,7 @@ class AsyncZP(AsyncBaseHTTPClient):
           status_code=e.response.status_code,
         ),
       ) from e
-    except httpx.RequestError as e:
+    except httpx2.RequestError as e:
       logger.error(f'Network error fetching {endpoint}: {e}')
       raise NetworkError(
         format_network_error('fetch page', endpoint, e),
@@ -405,7 +407,7 @@ class AsyncZP(AsyncBaseHTTPClient):
     max_retries: int = 3,
     backoff_factor: float = 1.0,
     **kwargs: Any,
-  ) -> httpx.Response:
+  ) -> httpx2.Response:
     """Compatibility wrapper for fetch_with_retry_async.
 
     Deprecated: Use fetch_with_retry_async() directly. This method exists
